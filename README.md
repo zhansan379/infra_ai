@@ -2,6 +2,9 @@
 
 LLM / Embedding / Rerank 调用基础设施，提供熔断、多模型路由、故障转移、速率限制、流式探活与调用统计。
 
+<img width="2848" height="1600" alt="infra_ai LLM基础设施层蓝图生成" src="https://github.com/user-attachments/assets/b62b8f9f-804a-4a7e-b7af-083f206ab9f4" />
+
+
 **包名**：`infra-ai`（至少需要 Python ≥ 3.10），安装后 `import infra_ai`。
 
 安装 `infra_ai`（二选一，推荐 uv）：
