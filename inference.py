@@ -19,7 +19,7 @@ from typing import Any
 
 from openai import AsyncOpenAI, OpenAI
 
-from infra_ai.config_loader import get_config as _get_config
+from infra_ai.core.config_loader import get_config as _get_config
 _cfg = _get_config()
 LLM_REQUEST_TIMEOUT = _cfg.LLM_REQUEST_TIMEOUT
 LLM_TIMEOUT_SCALE = _cfg.LLM_TIMEOUT_SCALE

@@ -149,7 +149,7 @@ def get_health_store() -> ModelHealthStore:
     """获取全局熔断器单例（延迟初始化，读取 config 配置）。"""
     global _store
     if _store is None:
-        from infra_ai.config_loader import get_config
+        from infra_ai.core.config_loader import get_config
         LLM_CIRCUIT_BREAKER = get_config().LLM_CIRCUIT_BREAKER
         threshold = LLM_CIRCUIT_BREAKER.get("failure_threshold", 2)
         open_sec = LLM_CIRCUIT_BREAKER.get("open_duration_sec", 30)

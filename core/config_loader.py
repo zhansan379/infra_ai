@@ -2,7 +2,7 @@
 配置加载器：从 config.yaml 读取配置，解析 `${ENV}` 占位符，暴露对象式单例。
 
 用法:
-    from infra_ai.config_loader import get_config
+    from infra_ai.core.config_loader import get_config
     cfg = get_config()
     cfg.LLM_ROUTING / cfg.EMBEDDING_ROUTING / cfg.LLM_REQUEST_TIMEOUT ...
 
@@ -20,7 +20,7 @@ import yaml
 
 logger = __import__("logging").getLogger(__name__)
 
-_CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
 
 # ------------------------------------------------------------------

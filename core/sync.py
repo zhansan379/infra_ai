@@ -7,7 +7,7 @@
 
 from typing import Any
 
-from infra_ai._async_utils import run_async_in_sync as _run_async_in_sync
+from infra_ai.core._async_utils import run_async_in_sync as _run_async_in_sync
 from infra_ai.inference import async_call_llm, async_call_vlm
 
 

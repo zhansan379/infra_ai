@@ -16,8 +16,8 @@ from typing import Any
 
 import httpx
 
-from infra_ai._async_utils import run_async_in_sync
-from infra_ai.config_loader import get_config as _get_config
+from infra_ai.core._async_utils import run_async_in_sync
+from infra_ai.core.config_loader import get_config as _get_config
 _cfg = _get_config()
 RERANK_RATE_LIMITS = _cfg.RERANK_RATE_LIMITS
 RERANK_ROUTING = _cfg.RERANK_ROUTING

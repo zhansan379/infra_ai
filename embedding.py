@@ -20,8 +20,8 @@ from typing import Any, Union
 
 import requests
 
-from infra_ai._async_utils import run_async_in_sync
-from infra_ai.config_loader import get_config as _get_config
+from infra_ai.core._async_utils import run_async_in_sync
+from infra_ai.core.config_loader import get_config as _get_config
 from infra_ai.core.rate_limiter import RateLimiter
 from infra_ai.core.router import ModelCandidate, iterate_candidates
 from infra_ai.core.stats import _CallStats, _snapshot, get_stat

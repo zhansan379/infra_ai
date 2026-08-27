@@ -250,7 +250,7 @@ def get_router() -> ModelRoutingExecutor:
     """获取全局路由器单例。"""
     global _router
     if _router is None:
-        from infra_ai.config_loader import get_config
+        from infra_ai.core.config_loader import get_config
         selector = ModelSelector(get_config().LLM_ROUTING)
         _router = ModelRoutingExecutor(selector)
     return _router

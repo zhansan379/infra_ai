@@ -21,13 +21,13 @@ pip install -e .
 ```
 infra_ai/
 ├── config.yaml               # 全部配置：路由 / 限速 / 熔断 / 超时重试（含 ${ENV} 占位符）
-├── config_loader.py          # 配置加载器：解析 config.yaml 与 ${ENV} 占位符，暴露对象式单例 get_config()
 ├── inference.py              # 推理核心：客户端构建、熔断/限速/重试、路由、批量、工具调用、异步 API
 ├── embedding.py              # Embedding 客户端（text 1536d / vl 768d 路由 + 降级）
 ├── rerank.py                 # Rerank 客户端（路由 + 降级）
-├── _async_utils.py           # 通用「异步 ↔ 同步」适配：run_async_in_sync
 ├── core/
 │   ├── __init__.py           # core 层规范直达面（from infra_ai.core import ...）
+│   ├── config_loader.py      # 配置加载器：解析 config.yaml 与 ${ENV} 占位符，暴露对象式单例 get_config()
+│   ├── _async_utils.py       # 通用「异步 ↔ 同步」适配：run_async_in_sync
 │   ├── rate_limiter.py       # RateLimiter（RPM/TPM 滑动窗口 + 动态并发 + EMA 自适应）
 │   ├── streaming.py          # 流式调用路径（SSE token 流 + 多模型故障转移）
 │   ├── sync.py               # call_llm / call_vlm 同步封装（任意上下文安全）
@@ -150,7 +150,7 @@ async_call_llm / async_call_vlm / async_call_llm_with_tools
 
 ## 模块说明
 
-### 配置加载 (`config_loader.py` + `config.yaml`)
+### 配置加载 (`core/config_loader.py` + `config.yaml`)
 
 所有配置集中在 `config.yaml`，加载时递归解析 `${ENV_VAR}` 占位符，敏感值（api_key 等）不落盘。
 
@@ -160,7 +160,7 @@ async_call_llm / async_call_vlm / async_call_llm_with_tools
 通过 `get_config()` 返回对象式单例：
 
 ```python
-from infra_ai.config_loader import get_config
+from infra_ai.core.config_loader import get_config
 cfg = get_config()
 cfg.LLM_ROUTING / cfg.EMBEDDING_ROUTING / cfg.RERANK_ROUTING / cfg.LLM_REQUEST_TIMEOUT ...
 ```
@@ -242,7 +242,7 @@ token 用量优先取流末 chunk 的真实 `usage`，字符估算仅作兜底�
 - `_extract_token_usage` 从 openai SDK 响应读取 `usage`（兼容 CompletionUsage 对象与 dict 包装）
 - `get_llm_stats()` 返回文本与视觉的累计统计；`get_all_stats()` 额外包含 embedding / rerank 等所有已注册累加器
 
-### 同步封装 (`_async_utils.py` + `sync.py`)
+### 同步封装 (`core/_async_utils.py` + `sync.py`)
 
 `run_async_in_sync(coro)` 自动检测当前是否在 asyncio 事件循环中：不在循环内用 `asyncio.run()` 创建临时循环；已在循环内（如 FastAPI/uvicorn）则在独立线程创建新循环执行。`call_llm` / `call_vlm` 与 rerank/embedding 的同步壳共用这一工具。
 
@@ -349,4 +349,4 @@ for r in results.results:
 
 - 顶层聚合：`infra_ai/__init__.py`（`from infra_ai import async_call_llm, rerank, ...`）
 - core 直达面：`infra_ai/core/__init__.py`（`from infra_ai.core import async_call_llm, RateLimiter, ...`）
-- 直连底层模块：`from infra_ai.inference import ...` / `from infra_ai.embedding import ...` / `from infra_ai.rerank import ...` / `from infra_ai.config_loader import get_config` / `from infra_ai.core.router import get_router` / `from infra_ai.core.errors import classify_error, ModelClientErrorType`
+- 直连底层模块：`from infra_ai.inference import ...` / `from infra_ai.embedding import ...` / `from infra_ai.rerank import ...` / `from infra_ai.core.config_loader import get_config` / `from infra_ai.core.router import get_router` / `from infra_ai.core.errors import classify_error, ModelClientErrorType`
