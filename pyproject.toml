@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "infra-ai"
+version = "0.1.0"
+description = "LLM 调用基础设施层：熔断、多模型路由、速率限制、流式故障转移与可观测性"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain-openai>=0.1",
+    "httpx>=0.24",
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# 本仓库使用方与测试
+dev = ["pytest>=7.0"]
+
+[tool.setuptools]
+# 包 infra_ai 直接位于仓库根目录，无需额外 src/ 目录。
+package-dir = { "infra_ai" = "." }
+packages = [
+    "infra_ai",
+    "infra_ai.core",
+]
+
+[tool.setuptools.package-data]
+infra_ai = ["config.yaml"]
