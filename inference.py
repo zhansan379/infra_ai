@@ -6,16 +6,18 @@ LLM 推理核心：客户端构建、熔断/限速/重试调用、多模型路�
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import mimetypes
 import os
 import time
+import weakref
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from langchain_openai import ChatOpenAI
+from openai import AsyncOpenAI, OpenAI
 
 from infra_ai.config_loader import get_config as _get_config
 _cfg = _get_config()
@@ -47,28 +49,184 @@ class _CircuitOpenError(Exception):
 
 
 # ============================================================
+# OpenAI 兼容客户端封装（替代 langchain_openai.ChatOpenAI）
+# ============================================================
+
+# 所有已创建 AsyncOpenAI 的注册表（WeakSet，避免强引用泄漏每个临时路由客户端）。
+# openai v3 的 AsyncHttpxClientWrapper.__del__ 只在“有运行中事件循环”时才调度关闭底层
+# httpx2 连接池；若宿主在 asyncio.run 结束后才让客户端被 GC，连接池的 httpcore2 异步生成器
+# 会在无存活 loop 时收尾，抛出 “generator didn't stop after athrow()” 噪音。
+# 托管方应在主流程结束、事件循环关闭前调用 aclose_all_clients() 显式关闭它们。
+_ASYNC_CLIENTS: "weakref.WeakSet[AsyncOpenAI]" = weakref.WeakSet()
+
+
+class _OpenAIClient:
+    """
+    OpenAI 兼容客户端的轻量封装，统一推理 / 流式 / 工具三条路径。
+
+    使用原生 openai SDK（OpenAI + AsyncOpenAI），仅暴露推理路径所需的最小面：
+    `.model_name` / `.bind()` / `acomplete()` / `astream()`。
+
+    厂商专有参数（如 reasoning_effort / extra_body / thinking）可经 bind()
+    固定，或每条调用通过 acomplete/astream 的 extra_kwargs 运行时传入。
+    """
+
+    def __init__(self, model_name: str, api_key: str | None = None,
+                 base_url: str | None = None, temperature: float | None = 0.7,
+                 timeout: float = LLM_REQUEST_TIMEOUT, **kwargs):
+        self.model_name = model_name
+        self.temperature = temperature
+        self._kwargs: dict[str, Any] = dict(kwargs)  # 固定 create() 参数
+        # openai SDK 不允许 api_key 为空；缺 key 时用占位符保证懒构造不崩溃，
+        # 真实缺口在请求期以 401 暴露（与旧 ChatOpenAI 的延迟错误契约一致）。
+        api_key = api_key or "sk-placeholder-not-configured"
+        self._client = OpenAI(
+            api_key=api_key, base_url=base_url,
+            timeout=timeout, max_retries=0,
+        )
+        self._aclient = AsyncOpenAI(
+            api_key=api_key, base_url=base_url,
+            timeout=timeout, max_retries=0,
+        )
+        _ASYNC_CLIENTS.add(self._aclient)
+
+    async def aclose(self):
+        """关闭本客户端持有的 AsyncOpenAI（连带 httpx2 连接池），幂等。"""
+        aclient, self._aclient = self._aclient, None
+        if aclient is not None:
+            try:
+                await aclient.close()
+            except Exception:
+                pass
+            _ASYNC_CLIENTS.discard(aclient)
+
+    def close(self):
+        """同步关闭本客户端持有的 OpenAI（阻塞 httpx），幂等。"""
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def bind(self, **kwargs):
+        """返回带额外 create() 参数的新实例（不改动共享单例）。"""
+        clone = copy.copy(self)
+        clone._kwargs = {**self._kwargs, **kwargs}
+        return clone
+
+    def bind_tools(self, tools):
+        return self.bind(tools=tools)
+
+    def _payload(self, messages, *, tools=None, extra_kwargs=None) -> dict[str, Any]:
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "stream": False,
+            **self._kwargs,
+        }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if tools:
+            payload["tools"] = tools
+        if extra_kwargs:
+            payload.update(extra_kwargs)
+        return payload
+
+    async def acomplete(self, messages, *, tools=None, extra_kwargs=None) -> Any:
+        """非流式调用，返回 openai ChatCompletion 响应。"""
+        return await self._aclient.chat.completions.create(
+            **self._payload(messages, tools=tools, extra_kwargs=extra_kwargs))
+
+    async def astream(self, messages, *, tools=None, extra_kwargs=None):
+        """流式调用，逐块 yield openai ChatCompletionChunk。"""
+        payload = self._payload(messages, tools=tools, extra_kwargs=extra_kwargs)
+        payload["stream"] = True
+        stream = await self._aclient.chat.completions.create(**payload)
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            # openai AsyncStream 在读到 [DONE] 后即 break，不会自动关闭 httpx2
+            # 响应体；若放任其被 GC/客户端关闭时收尾，httpcore2 的
+            # PoolByteStream.__aiter__ 会在无存活循环处被 athrow 中断，
+            # 抛 “generator didn't stop after athrow()” 关停噪音。
+            # 这里显式走 stream.close() → response.aclose() 的干净关闭路径，
+            # 直接把底层网络流归还/关闭，避免中途 abort。
+            await stream.close()
+
+
+def _build_openai(model_name: str, api_key: str | None = None,
+                  base_url: str | None = None, temperature: float = 0.7,
+                  use_json: bool = False) -> _OpenAIClient:
+    """按模型名构造 _OpenAIClient；use_json 时绑定 JSON 输出格式。"""
+    kw: dict[str, Any] = {}
+    if use_json:
+        kw["response_format"] = {"type": "json_object"}
+    return _OpenAIClient(
+        model_name=model_name,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=temperature,
+        **kw,
+    )
+
+
+# ============================================================
+# 资源清理：显式关闭客户端连接池
+# ============================================================
+
+async def aclose_all_clients() -> None:
+    """
+    关闭所有已创建的 AsyncOpenAI 客户端及其 httpx2 连接池（幂等）。
+
+    必须在宿主应用的 `await asyncio.run(main())` 主流程结束、事件循环关闭**之前**
+    调用，否则底层 httpcore2 连接池会在 GC 阶段（此时已无存活事件循环）收尾，
+    打印 “RuntimeError: generator didn't stop after athrow()” 关停噪音。
+
+    典型用法：
+
+        asyncio.run(main())
+        # ...（此处 loop 已关闭，不能再 await）
+        asyncio.run(aclose_all_clients())  # 干净关闭，无噪音
+
+    或把 aclose_all_clients() 放到 main() 返回值所在协程内部调用。
+
+    反复调用安全。
+    """
+    for client in list(_ASYNC_CLIENTS):
+        if client is None:
+            continue
+        try:
+            await client.close()  # openai AsyncOpenAI.close() → httpx2 AsyncClient.aclose()
+        except Exception:
+            pass
+    _ASYNC_CLIENTS.clear()
+
+
+# ============================================================
 # LLM 客户端初始化
 # ============================================================
 
 def _create_llm_from_routing(capability: str, temperature: float):
-    """从 LLM_ROUTING 配置中取最高优先级启用候选，创建 ChatOpenAI 实例（单模型回退用）。"""
+    """从 LLM_ROUTING 配置中取最高优先级启用候选，创建 _OpenAIClient（单模型回退用）。"""
     try:
         cap = _cfg.LLM_ROUTING.get(capability, {})
         candidates = cap.get("candidates", [])
         if candidates:
             c = candidates[0]
-            return ChatOpenAI(
-                model=c["model"],
+            return _OpenAIClient(
+                model_name=c["model"],
                 temperature=temperature,
-                api_key=c.get("api_key", ""),
-                base_url=c.get("base_url", ""),
+                api_key=c.get("api_key") or None,
+                base_url=c.get("base_url") or None,
             )
     except Exception:
         pass
     # fallback: 从 env 读取
     model = os.getenv(f"SF_{'CHAT_MODEL' if capability == 'chat' else 'VISION_MODEL'}", "")
-    return ChatOpenAI(
-        model=model or "Qwen/Qwen2.5-72B-Instruct-128K",
+    return _OpenAIClient(
+        model_name=model or "Qwen/Qwen2.5-72B-Instruct-128K",
         temperature=temperature,
         api_key=os.getenv("SF_API_KEY"),
         base_url=os.getenv("SF_BASE_URL", "https://api.siliconflow.cn/v1"),
@@ -175,11 +333,10 @@ def __getattr__(name: str):
 # ---- 路由辅助函数 ----
 
 def _get_model_for_target(target, use_json: bool = False):
-    """根据路由目标创建 ChatOpenAI 实例（复用已有配置）。"""
-    from langchain_openai import ChatOpenAI
+    """根据路由目标创建 _OpenAIClient 实例（复用已有配置）。"""
     candidate = target.candidate
-    model = ChatOpenAI(
-        model=candidate.model,
+    model = _OpenAIClient(
+        model_name=candidate.model,
         temperature=0.7 if "vision" not in candidate.id.lower() else 0.3,
         base_url=candidate.base_url or os.getenv("SF_BASE_URL", ""),
         api_key=candidate.api_key or os.getenv("SF_API_KEY", ""),
@@ -336,6 +493,7 @@ async def _invoke_with_retry(
     extra: dict[str, Any] | None = None,
     tools: list[dict[str, Any]] | None = None,
     model_key: str | None = None,
+    model_kwargs: dict[str, Any] | None = None,
 ):
     """
     带超时和重试的 LLM 调用。
@@ -346,9 +504,10 @@ async def _invoke_with_retry(
     可重试错误（限速/5xx/网络）耗尽全部尝试后记录完整上下文到日志文件与控制台。
 
     :param extra: 附加信息（如图片路径），失败时写入错误日志
-    :param tools: 可选工具列表（OpenAI function calling 格式），传入后使用 bind_tools()
+    :param tools: 可选工具列表（OpenAI function calling 格式），传入后透传给 create(tools=...)
     :param model_key: 熔断/健康标记身份（路由路径传 model_id，缺省用 model_name）
-    :return: 无 tools 时返回 str（content），有 tools 时返回 AIMessage 对象
+    :param model_kwargs: 透传给 create() 的厂商专有参数（如 reasoning_effort / extra_body）
+    :return: 无 tools 时返回 str（content），有 tools 时返回原生 message（含 .content/.tool_calls）
     """
     import random as _random
 
@@ -389,13 +548,9 @@ async def _invoke_with_retry(
         t0 = time.monotonic()
 
         try:
-            # 有工具时使用 bind_tools()，否则直接调用
-            if tools:
-                invoke_model = model.bind_tools(tools)
-            else:
-                invoke_model = model
+            # 非流式调用；tools / model_kwargs 透传 create()
             response = await asyncio.wait_for(
-                invoke_model.ainvoke(messages),
+                model.acomplete(messages, tools=tools, extra_kwargs=model_kwargs),
                 timeout=current_timeout,
             )
             elapsed = time.monotonic() - t0
@@ -418,15 +573,14 @@ async def _invoke_with_retry(
                 stats.summary(),
             )
 
-            if hasattr(response, 'content'):
-                # 熔断器：标记成功（统一身份）
-                get_health_store().mark_success(health_key)
+            # 熔断器：标记成功（统一身份）
+            get_health_store().mark_success(health_key)
 
-                # 有工具时返回完整 AIMessage（调用方需要 .tool_calls）
-                if tools:
-                    return response
-                return response.content
-            return str(response)
+            message = response.choices[0].message
+            # 有工具时返回完整 message（调用方需要 .tool_calls）
+            if tools:
+                return message
+            return message.content if message.content is not None else ""
 
         except TimeoutError:
             elapsed = time.monotonic() - t0
@@ -510,6 +664,7 @@ async def async_call_llm(
     *,
     extra: dict[str, Any] | None = None,
     model_name: str | None = None,
+    model_kwargs: dict[str, Any] | None = None,
 ) -> str:
     """
     异步调用文本大模型，带多模型路由、熔断器、速率限制和自动重试。
@@ -518,19 +673,12 @@ async def async_call_llm(
     :param use_json: 是否绑定 JSON 输出格式
     :param extra: 附加信息，失败时写入错误日志
     :param model_name: 指定模型名称（如 "Qwen/Qwen3.6-27B"），不传则使用默认路由
+    :param model_kwargs: 透传给 create() 的厂商专有参数（如 reasoning_effort / extra_body）
     :return: 模型响应文本
     """
     # 如果指定了模型名称，创建临时模型实例
     if model_name:
-        from langchain_openai import ChatOpenAI
-        temp_model = ChatOpenAI(
-            model=model_name,
-            temperature=0.7,
-            api_key=os.getenv("SF_API_KEY"),
-            base_url=os.getenv("SF_BASE_URL", "https://api.siliconflow.cn/v1"),
-        )
-        if use_json:
-            temp_model = temp_model.bind(response_format={"type": "json_object"})
+        temp_model = _build_openai(model_name, use_json=use_json, temperature=0.7)
 
         return await _invoke_with_retry(
             temp_model, messages,
@@ -538,6 +686,7 @@ async def async_call_llm(
             stats=_text_stats,
             label="text",
             extra=extra,
+            model_kwargs=model_kwargs,
         )
 
     # 尝试多模型路由
@@ -557,6 +706,7 @@ async def async_call_llm(
                 label="text",
                 extra=extra,
                 model_key=target.model_id,
+                model_kwargs=model_kwargs,
             )
 
         return await router.execute("chat", _call_with_target,
@@ -584,6 +734,7 @@ async def async_call_llm(
         stats=_text_stats,
         label="text",
         extra=extra,
+        model_kwargs=model_kwargs,
     )
 
 
@@ -593,9 +744,10 @@ async def async_call_llm_with_tools(
     *,
     extra: dict[str, Any] | None = None,
     model_name: str | None = None,
+    model_kwargs: dict[str, Any] | None = None,
 ):
     """
-    异步调用文本大模型（带原生工具调用），使用 LangChain bind_tools()。
+    异步调用文本大模型（带原生工具调用），透传 OpenAI tools。
 
     复用与 async_call_llm 相同的多模型路由、熔断器、速率限制和自动重试。
 
@@ -603,17 +755,12 @@ async def async_call_llm_with_tools(
     :param tools: 工具 schema 列表（OpenAI function calling 格式）
     :param extra: 附加信息，失败时写入错误日志
     :param model_name: 指定模型名称，不传则使用默认路由
-    :return: AIMessage 对象（含 .content 和 .tool_calls 属性）
+    :param model_kwargs: 透传给 create() 的厂商专有参数
+    :return: 原生 message 对象（含 .content 和 .tool_calls 属性）
     """
     # 如果指定了模型名称，创建临时模型实例
     if model_name:
-        from langchain_openai import ChatOpenAI
-        temp_model = ChatOpenAI(
-            model=model_name,
-            temperature=0.7,
-            api_key=os.getenv("SF_API_KEY"),
-            base_url=os.getenv("SF_BASE_URL", "https://api.siliconflow.cn/v1"),
-        )
+        temp_model = _build_openai(model_name, temperature=0.7)
         return await _invoke_with_retry(
             temp_model, messages,
             rate_limiter=_get_text_rate_limiter(),
@@ -621,6 +768,7 @@ async def async_call_llm_with_tools(
             label="text+tools",
             extra=extra,
             tools=tools,
+            model_kwargs=model_kwargs,
         )
 
     # 尝试多模型路由
@@ -641,6 +789,7 @@ async def async_call_llm_with_tools(
                 extra=extra,
                 tools=tools,
                 model_key=target.model_id,
+                model_kwargs=model_kwargs,
             )
 
         return await router.execute("chat", _call_with_target,
@@ -663,6 +812,7 @@ async def async_call_llm_with_tools(
         label="text+tools",
         extra=extra,
         tools=tools,
+        model_kwargs=model_kwargs,
     )
 
 
@@ -672,6 +822,7 @@ async def async_call_vlm(
     images: list[str] | None = None,
     *,
     extra: dict[str, Any] | None = None,
+    model_kwargs: dict[str, Any] | None = None,
 ) -> str:
     """
     异步调用视觉大模型（VLM），带速率限制、超时和自动重试。
@@ -680,6 +831,7 @@ async def async_call_vlm(
     :param use_json: 是否绑定 JSON 输出格式
     :param images: 可选图片 URL/base64 列表
     :param extra: 附加信息（如图片路径），失败时写入错误日志
+    :param model_kwargs: 透传给 create() 的厂商专有参数
     :return: 模型响应文本
     """
     vision_llm = _get_vision_llm()
@@ -724,6 +876,7 @@ async def async_call_vlm(
                 label="vision",
                 extra=extra,
                 model_key=target.model_id,
+                model_kwargs=model_kwargs,
             )
 
         return await router.execute("vision", _call_with_target,
@@ -743,6 +896,7 @@ async def async_call_vlm(
         stats=_vision_stats,
         label="vision",
         extra=extra,
+        model_kwargs=model_kwargs,
     )
 
 

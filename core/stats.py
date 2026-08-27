@@ -7,58 +7,44 @@ Token 用量提取 & 调用统计。
 
 def _extract_token_usage(response) -> dict[str, int]:
     """
-    从 LangChain AIMessage / BaseMessage 中提取 token 用量。
+    从 OpenAI 兼容响应（ChatCompletion / 兼容对象）中提取 token 用量。
 
-    兼容多种响应格式（usage_metadata / response_metadata / additional_kwargs）。
+    兼容 openai SDK 的 CompletionUsage 对象与部分提供商的 dict 包装。
     返回 {"input_tokens": N, "output_tokens": N, "total_tokens": N}，提取失败时均为 0。
     """
-    usage: dict[str, int] = {}
+    usage_data = getattr(response, 'usage', None)
+    if usage_data is None:
+        # 兜底：某些提供商把 usage 直接挂在 message 上
+        usage_data = getattr(response, 'token_usage', None) or getattr(
+            getattr(response, 'message', None), 'usage', None)
+    if usage_data is None:
+        return {}
 
-    # 1) usage_metadata（LangChain >= 0.3 标准属性）
-    if hasattr(response, 'usage_metadata') and response.usage_metadata:
-        um = response.usage_metadata
-        if isinstance(um, dict):
-            usage['input_tokens'] = int(um.get('input_tokens', 0))
-            usage['output_tokens'] = int(um.get('output_tokens', 0))
-            usage['total_tokens'] = int(um.get('total_tokens', 0))
-            if usage['total_tokens']:
-                return usage
+    if isinstance(usage_data, dict):
+        def _g(*keys: str) -> int:
+            for k in keys:
+                v = usage_data.get(k)
+                if v:
+                    return int(v)
+            return 0
+        return {
+            "input_tokens": _g("prompt_tokens", "input_tokens"),
+            "output_tokens": _g("completion_tokens", "output_tokens"),
+            "total_tokens": _g("total_tokens", "total"),
+        }
 
-    # 2) response_metadata（SiliconFlow / OpenAI 兼容格式）
-    if hasattr(response, 'response_metadata'):
-        rm = response.response_metadata or {}
-        for key in ('token_usage', 'usage'):
-            tu = rm.get(key)
-            if isinstance(tu, dict):
-                usage['input_tokens'] = int(tu.get('prompt_tokens', 0))
-                usage['output_tokens'] = int(tu.get('completion_tokens', 0))
-                usage['total_tokens'] = int(tu.get('total_tokens', 0))
-                if usage['total_tokens']:
-                    return usage
-
-    # 3) additional_kwargs（某些旧版本 / 自定义 provider）
-    if hasattr(response, 'additional_kwargs'):
-        ak = response.additional_kwargs or {}
-        for key in ('token_usage', 'usage'):
-            tu = ak.get(key)
-            if isinstance(tu, dict):
-                usage['input_tokens'] = int(tu.get('prompt_tokens', 0))
-                usage['output_tokens'] = int(tu.get('completion_tokens', 0))
-                usage['total_tokens'] = int(tu.get('total_tokens', 0))
-                if usage['total_tokens']:
-                    return usage
-
-    # 4) 顶层属性（某些封装会把 usage 直接挂在 message 上）
-    for attr in ('token_usage', 'usage', 'usage_metadata'):
-        tu = getattr(response, attr, None)
-        if isinstance(tu, dict):
-            usage['input_tokens'] = int(tu.get('prompt_tokens', tu.get('input_tokens', 0)))
-            usage['output_tokens'] = int(tu.get('completion_tokens', tu.get('output_tokens', 0)))
-            usage['total_tokens'] = int(tu.get('total_tokens', 0))
-            if usage['total_tokens']:
-                return usage
-
-    return usage
+    # CompletionUsage / 兼容对象
+    def _ga(*attrs: str) -> int:
+        for a in attrs:
+            v = getattr(usage_data, a, None)
+            if v:
+                return int(v)
+        return 0
+    return {
+        "input_tokens": _ga("prompt_tokens", "input_tokens"),
+        "output_tokens": _ga("completion_tokens", "output_tokens"),
+        "total_tokens": _ga("total_tokens"),
+    }
 
 
 def _extract_token_usage_from_text(text_length: int) -> dict:

@@ -1,5 +1,6 @@
 from .core import (
     RateLimiter,
+    aclose_all_clients,
     async_call_llm,
     async_call_llm_batch,
     async_call_llm_with_tools,
@@ -17,6 +18,7 @@ from .embedding import get_embedding_client, get_embedding_stats
 
 __all__ = [
     "RateLimiter",
+    "aclose_all_clients",
     "call_llm",
     "call_vlm",
     "async_call_llm",

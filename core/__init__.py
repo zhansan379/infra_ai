@@ -5,6 +5,7 @@ infra_ai.core：LLM 调用的规范直达面。
 """
 
 from infra_ai.inference import (
+    aclose_all_clients,
     async_call_llm,
     async_call_llm_batch,
     async_call_llm_with_tools,
@@ -19,6 +20,7 @@ from infra_ai.core.sync import call_llm, call_vlm
 
 __all__ = [
     "RateLimiter",
+    "aclose_all_clients",
     "call_llm",
     "call_vlm",
     "async_call_llm",

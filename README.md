@@ -4,7 +4,13 @@ LLM / Embedding / Rerank 调用基础设施，提供熔断、多模型路由、�
 
 **包名**：`infra-ai`（至少需要 Python ≥ 3.10），安装后 `import infra_ai`。
 
+安装 `infra_ai`（二选一，推荐 uv）：
+
 ```bash
+# 推荐：uv（生成 .venv + uv.lock）
+uv sync --all-extras
+
+# 备选：pip
 pip install -e .
 ```
 
@@ -37,7 +43,7 @@ infra_ai/
 | 类别 | 函数 | 说明 |
 |------|------|------|
 | 文本 | `async_call_llm(messages, use_json=True)` | 带路由/熔断/限速/重试的异步调用 |
-| 文本+工具 | `async_call_llm_with_tools(messages, tools)` | 原生工具调用，返回 AIMessage |
+| 文本+工具 | `async_call_llm_with_tools(messages, tools)` | 原生工具调用，返回 OpenAI message（含 `.tool_calls`） |
 | 视觉 | `async_call_vlm(messages, use_json=True, images=[...])` | VLM 调用 |
 | 批量 | `async_call_llm_batch(requests)` / `async_call_vlm_batch(requests)` | 并发调用，受限速器约束 |
 | 流式 | `async_stream_call_llm(messages, use_json=False)` | 逐个 token yield，多模型故障转移 |
@@ -49,6 +55,62 @@ infra_ai/
 | 限速 | `RateLimiter` | 可直接构造的自定义限速器 |
 
 所有符号已在包顶层导出：`from infra_ai import async_call_llm, rerank, get_all_stats, ...`。
+
+## 运行 Demo
+
+`examples/demo.py` 覆盖 12 类调用场景（同步 / 异步 / JSON 结构化 / 工具 / 视觉 / 流式 / 批量 / 重排 / 嵌入 / 统计 / 错误处理），通过文件顶部的 `RUN_xxx` 开关控制一次性跑哪些段。
+
+### 1. 初始化环境
+
+环境已用 [uv](https://docs.astral.sh/uv/) 接管，依赖由 `uv.lock` 锁定：
+
+```bash
+uv sync --all-extras   # 创建 .venv 并安装全部依赖（含 dev / pytest）
+```
+
+### 2. 配置 API Key
+
+`config.yaml` 中 `${ENV_VAR}` 占位符在加载时从环境变量解析。默认启用的候选依赖：
+
+| 环境变量 | 用途 |
+|----------|------|
+| `DASHSCOPE_API_KEY` | 文本 / 视觉 LLM 主候选（百炼 qwen） |
+| `SF_API_KEY` | embedding / rerank 等（硅基流动） |
+
+推荐复制项目内已备好的 `.env.example` 为 `.env`（已被 `.gitignore` 忽略，不会提交），填入真实 key：
+
+```bash
+cp .env.example .env    # Windows PowerShell: Copy-Item .env.example .env
+```
+
+### 3. 运行
+
+```bash
+uv run --env-file .env python examples/demo.py
+```
+
+若 key 已写入系统环境变量，可省略 `--env-file`：`uv run python examples/demo.py`。
+
+### 4. 段落开关
+
+demo 顶部 `RUN_xxx = True/False` 决定跑哪些段，默认开启：
+
+| 开关 | 场景 | 备注 |
+|------|------|------|
+| `RUN_SYNC` | 同步调用 | 默认开 |
+| `RUN_ASYNC` | 异步：串行 vs 并发耗时对比 | 默认开，会真实调用 2×N 次 API |
+| `RUN_TOOLS` | 原生工具调用 | 默认开 |
+| `RUN_STREAM` | 流式输出（SSE 逐 token） | 默认开 |
+| `RUN_RERANK` | 重排序 | 默认开，需 `SF_API_KEY` |
+| `RUN_STATS` | 调用统计 | 默认开，本地统计、无需任何 key |
+| `RUN_JSON` | JSON 结构化输出 | 默认关 |
+| `RUN_MODEL_OVERRIDE` | 指定模型覆盖路由 | 默认关 |
+| `RUN_VLM` | 视觉调用 VLM | 默认关，需图片 |
+| `RUN_BATCH` | 批量并发调用 | 默认关 |
+| `RUN_EMBEDDING` | 向量嵌入 | 默认关 |
+| `RUN_ERROR_HANDLING` | 熔断 / 重试耗尽演示 | 默认关，故意触发失败 |
+
+只跑某一段：把其余 `RUN_xxx` 全部置 `False` 即可。若对应 provider 的 key 未配齐，相关调用会走候选回退甚至直接失败——这是预期的。
 
 ## 快速开始
 
@@ -151,7 +213,7 @@ Probe-and-Commit 模式：
   → 超时/错误 → discard() → 候选模型 B → ...
 ```
 
-token 用量优先取流末 chunk 的真实 `usage_metadata`，字符估算仅作兜底。
+token 用量优先取流末 chunk 的真实 `usage`，字符估算仅作兜底。
 
 ### 调用核心 (`inference.py`)
 
@@ -160,7 +222,7 @@ token 用量优先取流末 chunk 的真实 `usage_metadata`，字符估算仅�
 - **超时线性递增**：`timeout_n = timeout * (1 + scale * n)`（如 base=180s, scale=0.4 → 180/252/324s）
 - **jitter 退避重试**：退避时间随重试次数增大并加入随机抖动
 - **致命错误短路**：401/403/4xx 配置类错误立即终止，不进入退避重试
-- **工具调用**：传入 `tools` 后经 `bind_tools()` 调用，返回完整 AIMessage（含 `.tool_calls`）
+- **工具调用**：传入 `tools` 后透传 `create(tools=...)`，返回原生 OpenAI message（含 `.content` / `.tool_calls`）
 - 失败写入 JSONL 错误日志（保留完整消息、剥离 base64 图片，记录限速/并发/统计快照）
 
 `async_call_llm` / `call_llm` 支持 `model_name` 参数覆盖路由，直达指定模型。
@@ -177,7 +239,7 @@ token 用量优先取流末 chunk 的真实 `usage_metadata`，字符估算仅�
 
 ### 统计 (`stats.py`)
 
-- `_extract_token_usage` 兼容多格式（`usage_metadata` / `response_metadata` / `additional_kwargs` / 顶层属性）
+- `_extract_token_usage` 从 openai SDK 响应读取 `usage`（兼容 CompletionUsage 对象与 dict 包装）
 - `get_llm_stats()` 返回文本与视觉的累计统计；`get_all_stats()` 额外包含 embedding / rerank 等所有已注册累加器
 
 ### 同步封装 (`_async_utils.py` + `sync.py`)

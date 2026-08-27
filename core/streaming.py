@@ -2,7 +2,7 @@
 流式调用路径：单个模型的 SSE token 流 + 多模型故障转移。
 
 与推理路径复用同一套熔断、错误分类与健康标记逻辑；
-token 用量优先取真实 usage（流末 chunk.usage_metadata），字符估算仅作兜底。
+token 用量优先取真实 usage（流末 chunk.usage），字符估算仅作兜底。
 """
 
 import asyncio
@@ -30,26 +30,22 @@ def _real_stream_usage(chunk) -> dict | None:
     """
     尝试从流式 chunk 提取真实 token 用量。
 
-    OpenAI 兼容流在最后一个 chunk 的 usage_metadata / usage 中带累计用量。
+    OpenAI SDK 流在最后一个 chunk 带 use (chunk.usage)，类型为 CompletionUsage。
     """
-    meta = getattr(chunk, "usage_metadata", None)
-    if isinstance(meta, dict) and meta.get("total_tokens"):
+    usage = getattr(chunk, "usage", None)
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
         return {
-            "input_tokens": int(meta.get("input_tokens", 0)),
-            "output_tokens": int(meta.get("output_tokens", 0)),
-            "total_tokens": int(meta.get("total_tokens", 0)),
+            "input_tokens": int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0),
+            "output_tokens": int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0),
+            "total_tokens": int(usage.get("total_tokens", 0) or 0),
         }
-    # response_metadata 兜底
-    rm = getattr(chunk, "response_metadata", None) or {}
-    for key in ("token_usage", "usage"):
-        tu = rm.get(key)
-        if isinstance(tu, dict) and tu.get("total_tokens"):
-            return {
-                "input_tokens": int(tu.get("prompt_tokens", 0)),
-                "output_tokens": int(tu.get("completion_tokens", 0)),
-                "total_tokens": int(tu.get("total_tokens", 0)),
-            }
-    return None
+    return {
+        "input_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+        "output_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+        "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+    }
 
 
 async def _stream_single_model(
@@ -88,6 +84,10 @@ async def _stream_single_model(
     full_response = ""
     usage_meta: dict | None = None
     stats = _text_stats if label in ("text", "chat") else _vision_stats
+    t0 = time.monotonic()
+    full_response = ""
+    usage_meta: dict | None = None
+    stats = _text_stats if label in ("text", "chat") else _vision_stats
     try:
         async for chunk in model.astream(messages):
             # 记录流末真实 usage（若有）
@@ -95,13 +95,21 @@ async def _stream_single_model(
             if candidate_usage is not None:
                 usage_meta = candidate_usage
 
+            # OpenAI SDK 流: chunk.choices[0].delta.content
             content = ""
-            if hasattr(chunk, 'content') and chunk.content:
-                content = chunk.content
-            elif isinstance(chunk, str):
-                content = chunk
-            elif isinstance(chunk, dict):
-                content = chunk.get("content", "")
+            try:
+                if chunk.choices and chunk.choices[0].delta:
+                    content = chunk.choices[0].delta.content or ""
+            except (IndexError, AttributeError):
+                content = ""
+            if not content:
+                # 兜底（部分兼容实现直接给 .content / dict）
+                if isinstance(chunk, str):
+                    content = chunk
+                elif hasattr(chunk, 'content') and chunk.content:
+                    content = chunk.content
+                elif isinstance(chunk, dict):
+                    content = chunk.get("content") or ""
             if content:
                 full_response += content
                 yield content
